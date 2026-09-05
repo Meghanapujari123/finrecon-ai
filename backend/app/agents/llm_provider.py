@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from typing import Any
 
 from app.config import get_settings
 
@@ -20,11 +21,11 @@ logger = logging.getLogger("finrecon.llm")
 
 
 class LLMUnavailableError(Exception):
+    """Raised when the configured LLM cannot be used."""
     pass
 
 
 class LLMProvider:
-
     def __init__(self):
         self.settings = get_settings()
 
@@ -40,6 +41,9 @@ class LLMProvider:
         system_prompt: str,
         user_prompt: str,
     ) -> dict:
+        """
+        Call the configured LLM and return a parsed JSON object.
+        """
 
         if not self.is_available():
             raise LLMUnavailableError(
@@ -61,8 +65,7 @@ class LLMProvider:
             )
 
         raise LLMUnavailableError(
-            f"Unsupported LLM_PROVIDER: "
-            f"{self.settings.LLM_PROVIDER}"
+            f"Unsupported LLM_PROVIDER: {self.settings.LLM_PROVIDER}"
         )
 
     # =========================================================
@@ -82,12 +85,17 @@ class LLMProvider:
                 "Anthropic package is not installed"
             ) from exc
 
+        if not self.settings.ANTHROPIC_API_KEY:
+            raise LLMUnavailableError(
+                "ANTHROPIC_API_KEY is not configured"
+            )
+
         client = anthropic.Anthropic(
             api_key=self.settings.ANTHROPIC_API_KEY,
             timeout=self.settings.LLM_REQUEST_TIMEOUT_SECONDS,
         )
 
-        last_error = None
+        last_error: Exception | None = None
 
         for attempt in range(2):
 
@@ -95,7 +103,7 @@ class LLMProvider:
 
                 response = client.messages.create(
                     model=self.settings.LLM_MODEL,
-                    max_tokens=4000,
+                    max_tokens=2000,
                     system=system_prompt,
                     messages=[
                         {
@@ -160,67 +168,12 @@ class LLMProvider:
             api_key=self.settings.GEMINI_API_KEY
         )
 
-        # -----------------------------------------------------
-        # IMPORTANT
-        #
-        # We give Gemini enough output space.
-        #
-        # Previously 1200 tokens was being reached and Gemini
-        # returned incomplete JSON with:
-        #
-        # FinishReason.MAX_TOKENS
-        #
-        # We also explicitly inspect finish_reason BEFORE trying
-        # to parse the JSON.
-        # -----------------------------------------------------
+        last_error: Exception | None = None
 
-        prompt = f"""
-You are FinRecon AI, a financial reconciliation investigation assistant.
-
-SYSTEM INSTRUCTIONS:
-{system_prompt}
-
-INVESTIGATION DATA:
-{user_prompt}
-
-Your task is to investigate the financial exception.
-
-Return ONLY ONE valid JSON object.
-
-Use EXACTLY this structure:
-
-{{
-  "root_cause": "short explanation",
-  "confidence": 0.90,
-  "recommendation": "short recommended action",
-  "evidence": [
-    "short evidence 1",
-    "short evidence 2"
-  ],
-  "explanation": "short explanation"
-}}
-
-STRICT RULES:
-
-1. Return JSON only.
-2. Do not use Markdown.
-3. Do not use code fences.
-4. Do not write anything before the JSON.
-5. Do not write anything after the JSON.
-6. Use double quotes.
-7. confidence must be a number between 0 and 1.
-8. Maximum 2 evidence items.
-9. Keep every string concise.
-10. Do not invent financial facts.
-11. Use only information present in the investigation data.
-12. Make sure the JSON is completely closed.
-"""
-
-        last_error = None
-
-        # -----------------------------------------------------
-        # First attempt
-        # -----------------------------------------------------
+        prompt = self._build_gemini_prompt(
+            system_prompt,
+            user_prompt,
+        )
 
         for attempt in range(2):
 
@@ -237,12 +190,7 @@ STRICT RULES:
                     contents=prompt,
                     config=types.GenerateContentConfig(
                         temperature=0.1,
-
-                        # IMPORTANT:
-                        # Give the model substantially more room
-                        # than the previous 1200-token limit.
-                        max_output_tokens=4096,
-
+                        max_output_tokens=2048,
                         response_mime_type="application/json",
                     ),
                 )
@@ -255,12 +203,13 @@ STRICT RULES:
                 )
 
                 # -------------------------------------------------
-                # Read finish reason BEFORE parsing.
+                # Finish reason
                 # -------------------------------------------------
 
                 finish_reason = None
 
                 try:
+
                     if response.candidates:
 
                         candidate = response.candidates[0]
@@ -284,11 +233,7 @@ STRICT RULES:
                     )
 
                 # -------------------------------------------------
-                # If Gemini explicitly says MAX_TOKENS, the JSON
-                # is potentially incomplete.
-                #
-                # DO NOT attempt to parse it.
-                # Retry with an ultra-compact schema.
+                # If truncated, retry with compact prompt.
                 # -------------------------------------------------
 
                 if self._is_max_tokens_reason(
@@ -296,9 +241,7 @@ STRICT RULES:
                 ):
 
                     logger.warning(
-                        "Gemini response was truncated by "
-                        "MAX_TOKENS. Retrying with "
-                        "ultra-compact JSON."
+                        "Gemini response reached MAX_TOKENS."
                     )
 
                     if attempt == 0:
@@ -314,20 +257,10 @@ STRICT RULES:
                         "Gemini repeatedly stopped at MAX_TOKENS"
                     )
 
-                # -------------------------------------------------
-                # Empty response
-                # -------------------------------------------------
-
                 if not text:
-
                     raise ValueError(
                         "Gemini returned an empty response"
                     )
-
-                # -------------------------------------------------
-                # Parse only after confirming response was not
-                # truncated.
-                # -------------------------------------------------
 
                 result = self._parse_json(text)
 
@@ -348,20 +281,10 @@ STRICT RULES:
                     exc,
                 )
 
-                # -------------------------------------------------
-                # If this was the first attempt, retry using an
-                # ultra-compact prompt.
-                #
-                # This catches both:
-                # - MAX_TOKENS
-                # - malformed/truncated JSON
-                # -------------------------------------------------
-
                 if attempt == 0:
 
                     logger.warning(
-                        "Retrying Gemini with "
-                        "ultra-compact JSON prompt."
+                        "Retrying Gemini with compact JSON prompt."
                     )
 
                     prompt = self._build_compact_prompt(
@@ -369,13 +292,69 @@ STRICT RULES:
                         user_prompt,
                     )
 
+                    continue
+
         raise LLMUnavailableError(
             f"Gemini did not return valid JSON: {last_error}"
         )
 
     # =========================================================
-    # COMPACT GEMINI PROMPT
+    # GEMINI PROMPTS
     # =========================================================
+
+    @staticmethod
+    def _build_gemini_prompt(
+        system_prompt: str,
+        user_prompt: str,
+    ) -> str:
+
+        return f"""
+You are FinRecon AI, a financial reconciliation investigation assistant.
+
+SYSTEM INSTRUCTIONS:
+{system_prompt}
+
+INVESTIGATION DATA:
+{user_prompt}
+
+Your task is to investigate the already-detected financial exception.
+
+Return ONLY ONE valid JSON object.
+
+The JSON MUST contain EXACTLY these fields:
+
+{{
+  "exception_type": "string",
+  "root_cause": "short explanation",
+  "evidence": ["short evidence 1", "short evidence 2"],
+  "financial_impact": 0,
+  "confidence": 0.90,
+  "recommended_action": "short recommended action",
+  "requires_human_approval": true,
+  "explanation": "short explanation"
+}}
+
+STRICT RULES:
+
+1. Return JSON only.
+2. Do not use Markdown.
+3. Do not use ``` fences.
+4. Do not write anything before the JSON.
+5. Do not write anything after the JSON.
+6. Use double quotes.
+7. confidence must be between 0 and 1.
+8. financial_impact must be a number.
+9. requires_human_approval must be true or false.
+10. evidence must be an array of strings.
+11. Maximum 2 evidence items.
+12. Keep all strings concise.
+13. Do not invent financial facts.
+14. Use ONLY information contained in the investigation data.
+15. recommended_action must be a safe recommendation, not an automatic financial change.
+16. Make sure the JSON is completely closed.
+
+Return the JSON object now.
+"""
 
     @staticmethod
     def _build_compact_prompt(
@@ -384,7 +363,7 @@ STRICT RULES:
     ) -> str:
 
         return f"""
-You are investigating a financial reconciliation exception.
+You are investigating one financial reconciliation exception.
 
 SYSTEM:
 {system_prompt}
@@ -397,10 +376,13 @@ Return ONLY valid JSON.
 Use exactly:
 
 {{
+  "exception_type": "type",
   "root_cause": "short",
-  "confidence": 0.9,
-  "recommendation": "short",
   "evidence": ["short"],
+  "financial_impact": 0,
+  "confidence": 0.9,
+  "recommended_action": "short",
+  "requires_human_approval": true,
   "explanation": "short"
 }}
 
@@ -409,19 +391,22 @@ Rules:
 - No Markdown.
 - No code fences.
 - Maximum ONE evidence item.
-- Keep every string under 20 words.
+- Keep strings very short.
+- financial_impact must be a number.
+- confidence must be between 0 and 1.
+- requires_human_approval must be true or false.
 - Do not invent facts.
-- Use only the supplied data.
+- Use only supplied data.
 - Close the JSON completely.
 """
 
     # =========================================================
-    # FINISH REASON CHECK
+    # FINISH REASON
     # =========================================================
 
     @staticmethod
     def _is_max_tokens_reason(
-        finish_reason,
+        finish_reason: Any,
     ) -> bool:
 
         if finish_reason is None:
@@ -453,7 +438,7 @@ Rules:
         text = text.strip()
 
         # -----------------------------------------------------
-        # Remove Markdown fences.
+        # Remove Markdown fences if present.
         # -----------------------------------------------------
 
         if text.startswith("```"):
@@ -474,7 +459,7 @@ Rules:
             text = text.strip()
 
         # -----------------------------------------------------
-        # Normal JSON parsing.
+        # First attempt: entire response.
         # -----------------------------------------------------
 
         try:
@@ -482,7 +467,6 @@ Rules:
             result = json.loads(text)
 
             if not isinstance(result, dict):
-
                 raise ValueError(
                     "LLM response is not a JSON object"
                 )
@@ -497,7 +481,7 @@ Rules:
             )
 
         # -----------------------------------------------------
-        # Try extracting a complete JSON object.
+        # Second attempt: balanced JSON extraction.
         # -----------------------------------------------------
 
         candidate = LLMProvider._extract_json_object(
@@ -521,7 +505,7 @@ Rules:
                 )
 
         # -----------------------------------------------------
-        # Try escaped JSON.
+        # Third attempt: escaped JSON.
         # -----------------------------------------------------
 
         try:
@@ -579,10 +563,10 @@ Rules:
 
             char = text[index]
 
-            # Inside a JSON string
             if in_string:
 
                 if escaped:
+
                     escaped = False
                     continue
 
@@ -595,17 +579,16 @@ Rules:
 
                 continue
 
-            # Start JSON string
             if char == '"':
+
                 in_string = True
                 continue
 
-            # Opening object
             if char == "{":
+
                 depth += 1
                 continue
 
-            # Closing object
             if char == "}":
 
                 depth -= 1
@@ -616,7 +599,6 @@ Rules:
                         start:index + 1
                     ]
 
-        # Object was never closed.
         return None
 
 
