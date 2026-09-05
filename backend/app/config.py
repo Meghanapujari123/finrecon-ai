@@ -25,7 +25,7 @@ class Settings(BaseSettings):
     # LLM provider abstraction
     # Supported: anthropic | openai | gemini | none
     LLM_PROVIDER: str = "gemini"
-    LLM_MODEL: str = "gemini-2.5-flash"
+    LLM_MODEL: str = "gemini-3.6-flash"
 
     ANTHROPIC_API_KEY: str | None = None
     OPENAI_API_KEY: str | None = None
